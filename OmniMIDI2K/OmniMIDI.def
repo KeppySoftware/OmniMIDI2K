@@ -1,0 +1,4 @@
+LIBRARY		OmniMIDI.dll
+EXPORTS
+	DriverProc
+	modMessage
