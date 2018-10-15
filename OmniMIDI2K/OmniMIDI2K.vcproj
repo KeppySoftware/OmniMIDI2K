@@ -38,6 +38,7 @@
 			<Tool
 				Name="VCCLCompilerTool"
 				AdditionalIncludeDirectories="&quot;C:\Documents and Settings\Administrator\Desktop\OmniMIDI9x\external_packages&quot;;&quot;C:\Program Files (x86)\Microsoft SDK\include&quot;"
+				PreprocessorDefinitions="_WINDLL;KDMAPI_ONLYSTRUCTS"
 			/>
 			<Tool
 				Name="VCManagedResourceCompilerTool"
@@ -155,6 +156,18 @@
 			</File>
 			<File
 				RelativePath=".\OmniMIDI2K.cpp"
+				>
+			</File>
+		</Filter>
+		<Filter
+			Name="Header Files"
+			>
+			<File
+				RelativePath=".\KDMAPI.h"
+				>
+			</File>
+			<File
+				RelativePath=".\OmniMIDI.h"
 				>
 			</File>
 		</Filter>

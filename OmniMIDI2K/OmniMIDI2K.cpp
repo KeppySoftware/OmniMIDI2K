@@ -23,9 +23,13 @@ typedef unsigned __int64 QWORD;
 #define CAUSE			1
 #define LONGMSG_MAXSIZE	65535
 
+#define LOCK_VM_IN_WORKING_SET 1
+#define LOCK_VM_IN_RAM 2
+
 #include <Windows.h>
 #include <process.h>
 #include <mmddk.h>
+#include "OmniMIDI.h"
 
 // BASS headers
 #include <bass.h>
@@ -66,7 +70,60 @@ static volatile ULONGLONG writehead = 0;	// Current write position in the buffer
 static volatile ULONGLONG readhead = 0;		// Current read position in the buffer
 static volatile LONGLONG eventcount = 0;	// Total events present in the buffer
 static ULONGLONG EvBufferSize = 4096;
-static BOOL AllowedToWrite = TRUE;			// See if the buffer can be written now
+
+// Built-in blacklist
+static LPCWSTR BuiltInBlacklist[30] =
+{
+	L"Battle.net Launcher.exe",
+	L"LogonUI.exe",
+	L"LSASS.EXE",
+	L"NVDisplay.Container.exe",
+	L"NVIDIA Share.exe",
+	L"NVIDIA Web Helper.exe",
+	L"RustClient.exe",
+	L"SearchUI.exe",
+	L"SecurityHealthService.exe",
+	L"SecurityHealthSystray.exe",
+	L"ShellExperienceHost.exe",
+	L"SndVol.exe",
+	L"WUDFHost.exe",
+	L"conhost.exe",
+	L"consent.exe",
+	L"csrss.exe",
+	L"ctfmon.exe",
+	L"dwm.exe",
+	L"explorer.exe",
+	L"lsass.exe",
+	L"mstsc.exe",
+	L"nvcontainer.exe",
+	L"nvsphelper64.exe",
+	L"services.exe",
+	L"smss.exe",
+	L"spoolsv.exe",
+	L"vcpkgsrv.exe",
+	L"winlogon.exe",
+	L"winmgmt.exe",
+	L"vmware-hostd.exe"
+};
+
+// Functions that aren't present in the Windows Server 2003 SDK
+typedef UINT (NTAPI * NLVM)(IN HANDLE process, IN OUT void** baseAddress, IN OUT ULONG* size, IN ULONG flags);
+typedef UINT (NTAPI * NULVM)(IN HANDLE process, IN OUT void** baseAddress, IN OUT ULONG* size, IN ULONG flags);
+typedef BOOL (NTAPI * PRFSW)(LPWSTR pszPath);
+typedef BOOL (NTAPI * PSPW)(LPWSTR pszPath);
+
+static HINSTANCE NTDLLInstance;
+static HINSTANCE SHLWAPIInstance;
+
+static FARPROC NLVMProc;
+static FARPROC NULVMProc;
+static FARPROC PRFSWProc;
+static FARPROC PSPWProc;
+
+static NLVM NtLockVirtualMemory;
+static NULVM NtUnlockVirtualMemory;
+static PRFSW PathRemoveFileSpecW;
+static PSPW PathStripPathW;
 
 extern "C" BOOL APIENTRY DllMain(HANDLE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
@@ -74,6 +131,22 @@ extern "C" BOOL APIENTRY DllMain(HANDLE hinstDLL, DWORD fdwReason, LPVOID lpvRes
 	case DLL_PROCESS_ATTACH:
 		hinst = (HINSTANCE)hinstDLL;
 		DisableThreadLibraryCalls((HMODULE)hinstDLL);
+
+		// Load funcs
+		NTDLLInstance = GetModuleHandle("ntdll");
+		NLVMProc = GetProcAddress(HMODULE(NTDLLInstance), "NtLockVirtualMemory");
+		NULVMProc = GetProcAddress(HMODULE(NTDLLInstance), "NtUnlockVirtualMemory");
+
+		SHLWAPIInstance = LoadLibrary("shlwapi.dll");
+		PRFSWProc = GetProcAddress(HMODULE(SHLWAPIInstance), "PathRemoveFileSpecW");
+		PSPWProc = GetProcAddress(HMODULE(SHLWAPIInstance), "PathStripPathW");
+		
+		if (!NLVMProc | !NULVMProc | !PRFSWProc | !PSPWProc) exit(0);
+
+		NtLockVirtualMemory = NLVM(NLVMProc);
+		NtUnlockVirtualMemory = NULVM(NULVMProc);
+		PathRemoveFileSpecW = PRFSW(PRFSWProc);
+		PathStripPathW = PSPW(PSPWProc);
 		break;
 	case DLL_PROCESS_DETACH: break;
 	case DLL_THREAD_ATTACH: break;
@@ -145,8 +218,8 @@ BOOL LoadBASSFunctions() {
 
 		memset(installpath, 0, MAX_PATH); 
 		GetModuleFileNameW(hinst, installpath, MAX_PATH);
+		PathRemoveFileSpecW(installpath);
 		MessageBoxW(NULL, L"Keep in mind that this is just a proof of concept!\nPlease don't complain about bugs and other stuff like that, kthx.", L"OmniMIDI -  WARNING", MB_OK | MB_ICONWARNING | MB_SYSTEMMODAL);
-		installpath[wcslen(installpath) - 13] = L'\0';
 
 		memset(basspath, 0, MAX_PATH); 
 		lstrcatW(basspath, installpath);
@@ -206,7 +279,8 @@ BOOL LoadBASSFunctions() {
 		return TRUE;
 	}
 	catch (...) {
-
+		exit(0);
+		return FALSE;
 	}
 }
 
@@ -232,12 +306,11 @@ MMRESULT ParseLongData(UINT uMsg, DWORD_PTR dwParam1, DWORD dwParam2) {
 MMRESULT ParseData(UINT uMsg, DWORD_PTR dwParam1, DWORD dwParam2) {
 	EnterCriticalSection(&mim_section);
 
-	long long tempevent = writehead;
 	if (++writehead >= EvBufferSize) writehead = 0;
 
-	evbuf[tempevent].uMsg = uMsg;
-	evbuf[tempevent].dwParam1 = dwParam1;
-	evbuf[tempevent].dwParam2 = dwParam2;
+	evbuf[writehead].uMsg = uMsg;
+	evbuf[writehead].dwParam1 = dwParam1;
+	evbuf[writehead].dwParam2 = dwParam2;
 
 	LeaveCriticalSection(&mim_section);
 
@@ -253,9 +326,8 @@ int PlayData() {
 	}
 	do {
 		EnterCriticalSection(&mim_section);
-		ULONGLONG tempevent = readhead;
 		if (++readhead >= EvBufferSize) readhead = 0;
-		evbuf_t TempBuffer = *(evbuf + tempevent);
+		evbuf_t TempBuffer = *(evbuf + readhead);
 		LeaveCriticalSection(&mim_section);
 
 		if (!(TempBuffer.dwParam1 - 0x80 & 0xC0))
@@ -294,10 +366,111 @@ void UpdateStream(void * nothing) {
 	}
 }
 
-STDAPI_(DWORD) modMessage(UINT uDeviceID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dwParam1, DWORD_PTR dwParam2){
+void InitializeBASS() {
 	char sfpath[MAX_PATH];
 	OPENFILENAME ofn;
 
+	if (!Device_Initialized) {
+		// Allocate buffer
+		evbuf = (evbuf_t *)calloc(EvBufferSize, sizeof(evbuf_t));
+		if (!evbuf) {
+			MessageBoxW(NULL, L"An error has occured while allocating the events buffer!", L"OmniMIDI - Error allocating memory", MB_OK | MB_ICONEXCLAMATION | MB_SYSTEMMODAL);
+			exit(0x8);
+		}
+
+		LoadBASSFunctions();
+		BOOL init = BASS_Init(-1, 44100, BASS_DEVICE_STEREO | BASS_DEVICE_DSOUND, 0, NULL);
+
+		DWORD len=BASS_GetConfig(BASS_CONFIG_UPDATEPERIOD);
+		BASS_INFO info;
+		BASS_GetInfo(&info);
+		len+=info.minbuf+1;
+		BASS_SetConfig(BASS_CONFIG_UPDATETHREADS, 0);
+		BASS_SetConfig(BASS_CONFIG_UPDATEPERIOD, 0);
+		BASS_SetConfig(BASS_CONFIG_BUFFER, len);
+		OMStream = BASS_MIDI_StreamCreate(16, 0, 44100);
+		BASS_ChannelSetAttribute(OMStream, BASS_ATTRIB_MIDI_CHANS, 16);
+		BASS_MIDI_StreamEvent(OMStream, 0, MIDI_EVENT_SYSTEM, MIDI_SYSTEM_DEFAULT);
+		BASS_MIDI_StreamEvent(OMStream, 9, MIDI_EVENT_DRUMS, 1);
+		BASS_ChannelSetAttribute(OMStream, BASS_ATTRIB_MIDI_VOICES, 500);
+		BASS_ChannelSetAttribute(OMStream, BASS_ATTRIB_MIDI_CPU, 75);
+		BASS_ChannelPlay(OMStream, FALSE);
+
+		memset(&ofn, 0, sizeof(ofn));
+		ofn.lStructSize = sizeof(ofn);
+		ofn.hwndOwner = NULL;
+		ofn.nMaxFile = MAX_PATH;
+		ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST| OFN_HIDEREADONLY | OFN_EXPLORER;
+
+		memset(sfpath, 0, MAX_PATH);
+		ofn.lpstrFilter="Soundfonts (sf2/sf2pack)\0*.sf2;*.sf2pack\0All files\0*.*\0\0";
+		ofn.lpstrFile=sfpath;
+		if (GetOpenFileName(&ofn)) { 
+			HSOUNDFONT NewSF = BASS_MIDI_FontInit(sfpath, 0);
+
+			if (NewSF) {
+				BASS_MIDI_FontLoad(NewSF, -1, -1);
+				BASS_MIDI_FONT sf;
+				sf.font = NewSF;
+				sf.preset= -1;
+				sf.bank = 0;
+				BASS_MIDI_StreamSetFonts(0, &sf, 1);
+				BASS_MIDI_StreamSetFonts(OMStream, &sf, 1);
+				BASS_MIDI_FontFree(DefaultSF);
+				DefaultSF = NewSF;
+			}
+			else {
+				MessageBoxW(NULL, L"Failed to load SoundFont.\nPress OK to quit.", L"ERROR", MB_OK | MB_ICONERROR | MB_SYSTEMMODAL);
+				exit(0);
+			}
+		}
+		else exit(0);
+		Device_Initialized = TRUE;
+		_beginthread(UpdateStream, 0, NULL); 
+	}
+}
+
+void TerminateBASS() {
+	if (Device_Initialized) {
+		// Free BASS
+		BASS_ChannelStop(OMStream);
+		BASS_StreamFree(OMStream);
+		BASS_Stop();
+		BASS_Free();
+
+		// Free buffer
+		memset(evbuf, 0, sizeof(evbuf));
+		free(evbuf);
+		evbuf = NULL;
+
+		// Send callback
+		DriverCallback(OMCallback, OMFlags, OMDevice, MOM_CLOSE, OMInstance, 0, 0);
+
+		Device_Initialized = FALSE;
+	}
+}
+
+DWORD BannedSystemProcess() {
+	// These processes are PERMANENTLY banned because of some internal bugs inside them.
+	wchar_t modulename[MAX_PATH];
+	memset(modulename, 0, MAX_PATH);
+	GetModuleFileNameW(NULL, modulename, MAX_PATH);
+	PathStripPathW(modulename);
+
+	// Check if the current process is banned
+	for (int i = 0; i < sizeof(BuiltInBlacklist)/sizeof(BuiltInBlacklist[0]); i++) {
+		// It's a match, the process is banned
+		if (!_wcsicmp(modulename, BuiltInBlacklist[i])) return 0x0;
+	}
+
+	// All good, go on
+	return 0x1;
+}
+
+// At last.
+#include "KDMAPI.h"
+
+STDAPI_(DWORD) modMessage(UINT uDeviceID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dwParam1, DWORD_PTR dwParam2){
 	switch (uMsg) {
 	case MODM_DATA:
 		return ParseData(uMsg, dwParam1, dwParam2);
@@ -306,98 +479,23 @@ STDAPI_(DWORD) modMessage(UINT uDeviceID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR
 	case MODM_OPEN:
 		// The driver doesn't support stream mode
 		if ((DWORD)dwParam2 & MIDI_IO_COOKED) return MMSYSERR_NOTENABLED;
+	
+		InitializeBASS();
 
-		if (!Device_Initialized) {
-			// Allocate buffer
-			evbuf = (evbuf_t *)calloc(EvBufferSize, sizeof(evbuf_t));
-			if (!evbuf) {
-				MessageBoxW(NULL, L"An error has occured while allocating the events buffer!", L"OmniMIDI - Error allocating memory", MB_OK | MB_ICONEXCLAMATION | MB_SYSTEMMODAL);
-				exit(0x8);
-			}
-
-			// Parse callback and instance
-			OMCallback = ((MIDIOPENDESC*)dwParam1)->dwCallback;
-			OMInstance = ((MIDIOPENDESC*)dwParam1)->dwInstance;
-			OMFlags = HIWORD((DWORD)dwParam2);
-
-			LoadBASSFunctions();
-			BOOL init = BASS_Init(-1, 44100, BASS_DEVICE_STEREO | BASS_DEVICE_DSOUND, 0, NULL);
-
-			DWORD len=BASS_GetConfig(BASS_CONFIG_UPDATEPERIOD);
-			BASS_INFO info;
-			BASS_GetInfo(&info);
-			len+=info.minbuf+1;
-			BASS_SetConfig(BASS_CONFIG_UPDATETHREADS, 0);
-			BASS_SetConfig(BASS_CONFIG_UPDATEPERIOD, 0);
-			BASS_SetConfig(BASS_CONFIG_BUFFER, len);
-			OMStream = BASS_MIDI_StreamCreate(16, 0, 44100);
-			BASS_ChannelSetAttribute(OMStream, BASS_ATTRIB_MIDI_CHANS, 16);
-			BASS_MIDI_StreamEvent(OMStream, 0, MIDI_EVENT_SYSTEM, MIDI_SYSTEM_DEFAULT);
-			BASS_MIDI_StreamEvent(OMStream, 9, MIDI_EVENT_DRUMS, 1);
-			BASS_ChannelSetAttribute(OMStream, BASS_ATTRIB_MIDI_VOICES, 256);
-			BASS_ChannelSetAttribute(OMStream, BASS_ATTRIB_MIDI_CPU, 75);
-			BASS_ChannelPlay(OMStream, FALSE);
-
-			memset(&ofn, 0, sizeof(ofn));
-			ofn.lStructSize = sizeof(ofn);
-			ofn.hwndOwner = NULL;
-			ofn.nMaxFile = MAX_PATH;
-			ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST| OFN_HIDEREADONLY | OFN_EXPLORER;
-
-			memset(sfpath, 0, MAX_PATH);
-			ofn.lpstrFilter="Soundfonts (sf2/sf2pack)\0*.sf2;*.sf2pack\0All files\0*.*\0\0";
-			ofn.lpstrFile=sfpath;
-			if (GetOpenFileName(&ofn)) { 
-				HSOUNDFONT NewSF = BASS_MIDI_FontInit(sfpath, 0);
-				if (NewSF) {
-					BASS_MIDI_FontLoad(NewSF, -1, -1);
-					BASS_MIDI_FONT sf;
-					sf.font = NewSF;
-					sf.preset= -1;
-					sf.bank = 0;
-					BASS_MIDI_StreamSetFonts(0, &sf, 1);
-					BASS_MIDI_StreamSetFonts(OMStream, &sf, 1);
-					BASS_MIDI_FontFree(DefaultSF);
-					DefaultSF = NewSF;
-				}
-				else {
-					MessageBoxW(NULL, L"Failed to load SoundFont.\nPress OK to quit.", L"ERROR", MB_OK | MB_ICONERROR | MB_SYSTEMMODAL);
-					exit(0);
-				}
-			}
-			else exit(0);
- 
-			Device_Initialized = TRUE;
-			_beginthread(UpdateStream, 0, NULL); 
-		}
-		// Tell the app that the driver is ready
+		// Parse callback and instance
+		OMCallback = ((MIDIOPENDESC*)dwParam1)->dwCallback;
+		OMInstance = ((MIDIOPENDESC*)dwParam1)->dwInstance;
+		OMFlags = HIWORD((DWORD)dwParam2);
 		DriverCallback(OMCallback, OMFlags, OMDevice, MOM_OPEN, OMInstance, 0, 0);
 		return MMSYSERR_NOERROR;
 	case MODM_CLOSE:
-		if (Device_Initialized) {
-			// Free BASS
-			BASS_ChannelStop(OMStream);
-			BASS_StreamFree(OMStream);
-			BASS_Stop();
-			BASS_Free();
-
-			// Free buffer
-			memset(evbuf, 0, sizeof(evbuf));
-			free(evbuf);
-			evbuf = NULL;
-
-			// Send callback
-			DriverCallback(OMCallback, OMFlags, OMDevice, MOM_CLOSE, OMInstance, 0, 0);
-
-			Device_Initialized = FALSE;
-		}
 		return MMSYSERR_NOERROR;
 	case MODM_PREPARE:
 		// Pass it to a KDMAPI function
-		return MMSYSERR_NOTSUPPORTED;
+		return PrepareLongData((MIDIHDR*)dwParam1);
 	case MODM_UNPREPARE:
 		// Pass it to a KDMAPI function
-		return MMSYSERR_NOTSUPPORTED;
+		return UnprepareLongData((MIDIHDR*)dwParam1);
 	case MODM_RESET:
 		BASS_MIDI_StreamEvent(OMStream, 0, MIDI_EVENT_SYSTEM, MIDI_SYSTEM_DEFAULT);
 		BASS_MIDI_StreamEvent(OMStream, 0, MIDI_EVENT_SYSTEMEX, MIDI_SYSTEM_DEFAULT);
