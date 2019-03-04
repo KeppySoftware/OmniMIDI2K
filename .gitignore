@@ -1,3 +1,7 @@
 
 *.user
 *.ncb
+debug/
+Release/
+OmniMIDI2K/debug/
+OmniMIDI2K/Release/

@@ -1,7 +1,7 @@
 // KDMAPI calls
 
 BOOL KDMAPI ReturnKDMAPIVer(LPDWORD Major, LPDWORD Minor, LPDWORD Build, LPDWORD Revision) {
-	*Major = 1; *Minor = 30; *Build = 0; *Revision = 51;
+	*Major = 1; *Minor = 51; *Build = 0; *Revision = 0;
 	MessageBoxW(NULL, L"You're using OmniMIDI2K!!!", L"OmniMIDI -  WARNING", MB_OK | MB_ICONWARNING | MB_SYSTEMMODAL);
 	return TRUE;
 }
@@ -11,17 +11,22 @@ BOOL KDMAPI IsKDMAPIAvailable() {
 	return TRUE;
 }
 
-VOID KDMAPI InitializeKDMAPIStream() {
+BOOL KDMAPI InitializeKDMAPIStream() {
 	InitializeBASS();
+	return TRUE;
 }
 
-VOID KDMAPI TerminateKDMAPIStream() {
-	TerminateBASS();
+BOOL KDMAPI TerminateKDMAPIStream() {
+	return TRUE;
 }
 
 VOID KDMAPI ResetKDMAPIStream() {
 	BASS_MIDI_StreamEvent(OMStream, 0, MIDI_EVENT_SYSTEM, MIDI_SYSTEM_DEFAULT);
 	BASS_MIDI_StreamEvent(OMStream, 0, MIDI_EVENT_SYSTEMEX, MIDI_SYSTEM_DEFAULT);
+}
+
+BOOL KDMAPI SendCustomEvent(DWORD eventtype, DWORD chan, DWORD param) {
+	return BASS_MIDI_StreamEvent(OMStream, chan, eventtype, param);
 }
 
 MMRESULT KDMAPI SendDirectData(DWORD dwMsg) {
@@ -73,8 +78,9 @@ MMRESULT KDMAPI UnprepareLongData(MIDIHDR* IIMidiHdr) {
 	return MMSYSERR_NOERROR;
 }
 
-VOID KDMAPI ChangeDriverSettings(const Settings* Struct, DWORD StructSize) {
+BOOL KDMAPI DriverSettings(DWORD Setting, DWORD Mode, LPVOID Value, UINT cbValue) {
 	MessageBox(NULL, "Not available in OmniMIDI2K.", "ERROR", MB_OK | MB_ICONWARNING | MB_SYSTEMMODAL);
+	return FALSE;
 }
 
 VOID KDMAPI LoadCustomSoundFontsList(const wchar_t* Directory) {
@@ -84,4 +90,8 @@ VOID KDMAPI LoadCustomSoundFontsList(const wchar_t* Directory) {
 DebugInfo* KDMAPI GetDriverDebugInfo() {
 	MessageBox(NULL, "Not available in OmniMIDI2K.", "ERROR", MB_OK | MB_ICONWARNING | MB_SYSTEMMODAL);
 	return NULL;
+}
+
+UINT KDMAPI timeGetTime64() {
+	return timeGetTime();
 }

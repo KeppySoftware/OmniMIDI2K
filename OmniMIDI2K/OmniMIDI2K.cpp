@@ -28,12 +28,12 @@ typedef unsigned __int64 QWORD;
 
 #include <Windows.h>
 #include <process.h>
-#include <mmddk.h>
+#include "..\external_packages\mmddk.h"
 #include "OmniMIDI.h"
 
 // BASS headers
-#include <bass.h>
-#include <bassmidi.h>
+#include "..\external_packages\bass.h"
+#include "..\external_packages\bassmidi.h"
 
 #define LOADBASSFUNCTION(f) *((void**)&f)=GetProcAddress(bass,#f)
 #define LOADBASSMIDIFUNCTION(f) *((void**)&f)=GetProcAddress(bassmidi,#f)
@@ -59,13 +59,13 @@ static HDRVR OMDevice = NULL;
 HINSTANCE hinst = NULL;
 
 // EVBuffer
-struct evbuf_t {
-	UINT			uMsg;
-	DWORD_PTR		dwParam1;
-	DWORD_PTR		dwParam2;
-};	// The buffer's structure
+struct EventsBuffer {
+	DWORD*					Buffer;
+	volatile ULONGLONG		ReadHead;
+	ULONGLONG				WriteHead;
+};
 
-static evbuf_t * evbuf;						// The buffer
+static EventsBuffer EVBuffer; // The buffer
 static volatile ULONGLONG writehead = 0;	// Current write position in the buffer
 static volatile ULONGLONG readhead = 0;		// Current read position in the buffer
 static volatile LONGLONG eventcount = 0;	// Total events present in the buffer
@@ -304,44 +304,61 @@ MMRESULT ParseLongData(UINT uMsg, DWORD_PTR dwParam1, DWORD dwParam2) {
 }
 
 MMRESULT ParseData(UINT uMsg, DWORD_PTR dwParam1, DWORD dwParam2) {
-	EnterCriticalSection(&mim_section);
+	ULONGLONG NextWriteHead = EVBuffer.WriteHead + 1;
+	if (NextWriteHead >= EvBufferSize) NextWriteHead = 0;
 
-	if (++writehead >= EvBufferSize) writehead = 0;
+	if (NextWriteHead != EVBuffer.ReadHead)
+	{
+		EVBuffer.Buffer[EVBuffer.WriteHead] = dwParam1;
+		EVBuffer.WriteHead = NextWriteHead;
+	}
+	else
+	{
+		if (NextWriteHead >= EvBufferSize)
+			NextWriteHead = EVBuffer.ReadHead; //guaranteed to be always in bounds
 
-	evbuf[writehead].uMsg = uMsg;
-	evbuf[writehead].dwParam1 = dwParam1;
-	evbuf[writehead].dwParam2 = dwParam2;
+		if(EvBufferSize >= 2)
+			while (NextWriteHead == EVBuffer.ReadHead) /*do sleep or something*/;
+		else
+		{
+			volatile DWORD* dwVolatileEvent = EVBuffer.Buffer; // + NextWriteHead;
+			/* EvBuffer resize resets both heads to 0, so checking
+				anything but the first event in the buffer will softlock completely*/
+			while (~*dwVolatileEvent) /*do sleep or something*/;
+		}
 
-	LeaveCriticalSection(&mim_section);
+		EVBuffer.Buffer[EVBuffer.WriteHead] = dwParam1;
+		EVBuffer.WriteHead = NextWriteHead;
+	}
+
+	EVBuffer.Buffer[EVBuffer.WriteHead] = dwParam1;
+	EVBuffer.WriteHead = NextWriteHead;
 
 	// Haha everything is fine
 	return MMSYSERR_NOERROR;
 }
 
-int PlayData() {
-	ULONGLONG whe = writehead;
-
-	if (!((readhead != whe) ? ~0 : 0)) {
-		return ~0;
-	}
-	do {
-		EnterCriticalSection(&mim_section);
-		if (++readhead >= EvBufferSize) readhead = 0;
-		evbuf_t TempBuffer = *(evbuf + readhead);
-		LeaveCriticalSection(&mim_section);
-
-		if (!(TempBuffer.dwParam1 - 0x80 & 0xC0))
-		{
-			BASS_MIDI_StreamEvents(OMStream, BASS_MIDI_EVENTS_RAW, &TempBuffer.dwParam1, 3);
-			break;
-		}
-
+void SendToBASSMIDI(DWORD dwParam1) {
 		DWORD len = 3;
 
-		if (!((TempBuffer.dwParam1 - 0xC0) & 0xE0)) len = 2;
-		else if ((TempBuffer.dwParam1 & 0xF0) == 0xF0)
+	switch (dwParam1 & 0xF0) {
+	case 0x90:
+		BASS_MIDI_StreamEvent(OMStream, dwParam1 & 0xF, MIDI_EVENT_NOTE, dwParam1 >> 8);
+		return;
+	case 0x80:
+		BASS_MIDI_StreamEvent(OMStream, dwParam1 & 0xF, MIDI_EVENT_NOTE, (BYTE)(dwParam1 >> 8));
+		return;
+	default:
+		if (!(dwParam1 - 0x80 & 0xC0))
 		{
-			switch (TempBuffer.dwParam1 & 0xF)
+			BASS_MIDI_StreamEvents(OMStream, BASS_MIDI_EVENTS_RAW, &dwParam1, 3);
+			return;
+		}
+
+		if (!((dwParam1 - 0xC0) & 0xE0)) len = 2;
+		else if ((dwParam1 & 0xF0) == 0xF0)
+		{
+			switch (dwParam1 & 0xF)
 			{
 			case 3:
 				len = 2;
@@ -351,16 +368,36 @@ int PlayData() {
 				break;
 			}
 		}
-		
-		BASS_MIDI_StreamEvents(OMStream, BASS_MIDI_EVENTS_RAW, &TempBuffer.dwParam1, len);
-	} while ((readhead != whe) ? ~0 : 0);
+
+		BASS_MIDI_StreamEvents(OMStream, BASS_MIDI_EVENTS_RAW, &dwParam1, len);
+		return;
+	}
+}
+
+void __inline PBufDataHyper(void) {
+	
+	DWORD dwParam1 = EVBuffer.Buffer[EVBuffer.ReadHead];
+	if (++EVBuffer.ReadHead >= EvBufferSize) EVBuffer.ReadHead = 0;
+
+	SendToBASSMIDI(dwParam1);
+}
+
+int __inline BufferCheck(void) {
+	return (EVBuffer.ReadHead != EVBuffer.WriteHead);
+}
+
+DWORD __inline PlayBufferedData(void) {
+	if (!BufferCheck()) return 1;
+
+	do PBufDataHyper();
+	while (EVBuffer.ReadHead != EVBuffer.WriteHead);
 
 	return 0;
 }
 
 void UpdateStream(void * nothing) {
 	while (Device_Initialized) {
-		PlayData();
+		PlayBufferedData();
 		BASS_ChannelUpdate(OMStream, 0);
 		Sleep(1);
 	}
@@ -372,8 +409,8 @@ void InitializeBASS() {
 
 	if (!Device_Initialized) {
 		// Allocate buffer
-		evbuf = (evbuf_t *)calloc(EvBufferSize, sizeof(evbuf_t));
-		if (!evbuf) {
+		EVBuffer.Buffer = (DWORD *)calloc(EvBufferSize, sizeof(DWORD));
+		if (!EVBuffer.Buffer) {
 			MessageBoxW(NULL, L"An error has occured while allocating the events buffer!", L"OmniMIDI - Error allocating memory", MB_OK | MB_ICONEXCLAMATION | MB_SYSTEMMODAL);
 			exit(0x8);
 		}
@@ -439,9 +476,9 @@ void TerminateBASS() {
 		BASS_Free();
 
 		// Free buffer
-		memset(evbuf, 0, sizeof(evbuf));
-		free(evbuf);
-		evbuf = NULL;
+		memset(EVBuffer.Buffer, 0, sizeof(EVBuffer.Buffer));
+		free(EVBuffer.Buffer);
+		EVBuffer.Buffer = NULL;
 
 		// Send callback
 		DriverCallback(OMCallback, OMFlags, OMDevice, MOM_CLOSE, OMInstance, 0, 0);
@@ -504,7 +541,7 @@ STDAPI_(DWORD) modMessage(UINT uDeviceID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR
 		DriverCallback(OMCallback, OMFlags, OMDevice, MOM_DONE, OMInstance, 0, 0);
 		return MMSYSERR_NOERROR;
 	case MODM_GETNUMDEVS:
-		return 0x1;
+		return BannedSystemProcess();
 	case MODM_GETDEVCAPS:
 		return modGetCaps((PVOID)dwParam1, (DWORD)dwParam2);
 	case DRV_QUERYDEVICEINTERFACESIZE:
